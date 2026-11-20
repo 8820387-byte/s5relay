@@ -122,7 +122,7 @@ fi
 # ---------------------------------------------------------------- 安装
 echo ">>> [1/6] 安装依赖"
 apt-get update -y >/dev/null
-DEBIAN_FRONTEND=noninteractive apt-get install -y curl openssl ca-certificates iproute2 python3 cron >/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y curl openssl ca-certificates iproute2 python3 cron qrencode >/dev/null
 
 echo ">>> [2/6] 安装 sing-box"
 if ! command -v sing-box >/dev/null; then
@@ -280,7 +280,8 @@ cat > "$APP" <<'PYEOF'
 #   render                     重新生成 clash.yaml
 #   add 名称 地址 端口 [账号] [密码]
 #   passwd                     重置后台密码（打印新密码）
-import hashlib, hmac, html, json, os, re, secrets, socket, ssl, struct, sys, threading, time
+import base64, hashlib, hmac, html, json, os, re, secrets, socket, ssl, struct, subprocess, sys, threading, time
+from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 
@@ -411,13 +412,38 @@ def render():
         L += ["proxy-groups:", '  - name: "🚀 节点选择"', "    type: select", "    proxies:"]
         L += [f"      - {q(n)}" for n in names + ["自建-Reality", "自建-Hy2"]]
         L += ["      - DIRECT", ""]
-        text = "\n".join(L) + "\n" + FOOTER
+        footer = FOOTER
+        if b.get("domain"):   # 自己的网站（后台/订阅）一律直连，更新订阅不绕代理
+            footer = footer.replace("rules:\n", f"rules:\n  - DOMAIN,{b['domain']},DIRECT\n", 1)
+        text = "\n".join(L) + "\n" + footer
         tmp = OUT + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
         os.chmod(tmp, 0o600)
         os.replace(tmp, OUT)
         return text
+
+
+# ---------------------------------------------------------------- 分享链接 / 二维码
+def share_links(b):
+    ip = b["ip"]
+    v = (f"vless://{b['uuid']}@{ip}:{b['reality_port']}?encryption=none&flow=xtls-rprx-vision"
+         f"&security=reality&sni={quote(b['sni'])}&fp=chrome&pbk={b['pub_key']}&sid={b['short_id']}"
+         f"&type=tcp#Reality")
+    if b.get("domain"):
+        h = f"hysteria2://{b['hy2_pass']}@{ip}:{b['hy2_port']}?sni={quote(b['domain'])}#Hy2"
+    else:
+        h = f"hysteria2://{b['hy2_pass']}@{ip}:{b['hy2_port']}?sni=bing.com&insecure=1#Hy2"
+    return [("自建-Reality（推荐）", v), ("自建-Hy2", h)]
+
+
+def qr_data_uri(text):
+    try:
+        svg = subprocess.run(["qrencode", "-t", "SVG", "-m", "2", "-s", "6", "-o", "-", text],
+                             capture_output=True, timeout=5, check=True).stdout
+        return "data:image/svg+xml;base64," + base64.b64encode(svg).decode()
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------- S5 校验 / 解析
@@ -603,6 +629,10 @@ th{color:var(--mut);font-weight:500;font-size:12px}td.act{white-space:nowrap;tex
 #login{max-width:360px;margin:12vh auto}
 #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#111;color:#fff;padding:8px 16px;border-radius:6px;display:none;z-index:9}
 .hide{display:none}
+.qrs{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-bottom:8px}
+.qr{border:1px solid var(--line);border-radius:8px;padding:12px;text-align:center}
+.qr img{width:240px;height:240px;max-width:100%;background:#fff;border-radius:6px;image-rendering:pixelated}
+.qr b{display:block;margin-bottom:8px}.qr button{margin-top:8px}
 </style></head><body>
 <div id="login" class="card hide">
   <h2>s5relay 后台登录</h2>
@@ -615,7 +645,17 @@ th{color:var(--mut);font-weight:500;font-size:12px}td.act{white-space:nowrap;tex
   <div class="card">
     <h2>订阅链接</h2>
     <div class="row"><input id="sub" readonly><button id="bCopy">复制</button><button class="g" id="bRot">换新链接</button></div>
-    <p class="mut">Clash Verge → 订阅 → 新建 → Remote → 粘贴，打开「允许危险证书」。在这里改了 S5 后，Clash 里点一下「更新」就生效。链接泄露了就点「换新链接」。</p>
+    <p class="mut" id="subHint"></p>
+  </div>
+
+  <div class="card">
+    <div class="row" style="margin-bottom:8px"><h2 style="margin:0">扫码 / 分享</h2><button class="g" id="bShare">显示</button></div>
+    <div id="shareBox" class="hide">
+      <div class="qrs" id="qrs"></div>
+      <p class="mut">订阅二维码：手机 Clash（FlClash / Stash / Clash Meta）扫码导入，包含全部 S5 和加速链路。<br>
+      Reality / Hy2：单个前置节点，可导入 v2rayN、Shadowrocket（小火箭）、NekoBox、sing-box 等。<br>
+      ⚠ 拿到这些的人就能用你的服务器，只给自己的设备用。泄露了重新运行安装命令即可全部换新。</p>
+    </div>
   </div>
 
   <div class="card">
@@ -672,7 +712,22 @@ function draw(){
     tb.append(tr);
   }
 }
-async function refresh(){const j=await api('list');items=j.items;$('sub').value=j.sub_url;draw();show(true)}
+async function refresh(){const j=await api('list');items=j.items;$('sub').value=j.sub_url;
+  $('subHint').textContent='Clash Verge → 订阅 → 新建 → Remote → 粘贴'+(j.domain?'':'，打开「允许危险证书」')+'。在这里改了 S5 后，Clash 里点一下「更新」就生效。链接泄露了就点「换新链接」。';
+  draw();show(true)}
+function qrCard(name,link,qr){
+  const d=document.createElement('div');d.className='qr';
+  const b=document.createElement('b');b.textContent=name;d.append(b);
+  if(qr){const i=document.createElement('img');i.src=qr;i.alt=name;d.append(i)}
+  else{const m=document.createElement('p');m.className='mut';m.textContent='二维码生成失败，请复制链接';d.append(m)}
+  d.append(document.createElement('br'),btn('复制链接','g',async()=>{try{await navigator.clipboard.writeText(link);toast('已复制')}catch(e){prompt('手动复制：',link)}}));
+  return d;
+}
+$('bShare').onclick=async()=>{
+  const box=$('shareBox');
+  if(!box.classList.contains('hide')){box.classList.add('hide');$('qrs').replaceChildren();$('bShare').textContent='显示';return}
+  try{const j=await api('share');$('qrs').replaceChildren(...j.items.map(x=>qrCard(x.name,x.link,x.qr)));
+    box.classList.remove('hide');$('bShare').textContent='隐藏'}catch(e){toast(e.message)}};
 async function test(it){
   const c=$('r'+it.id);if(c){c.textContent='测试中…';c.className='mut'}
   try{const j=await api('test',{id:it.id});
@@ -685,7 +740,7 @@ $('bLogin').onclick=async()=>{try{await api('login',{password:$('pw').value});$(
 $('pw').onkeydown=e=>{if(e.key==='Enter')$('bLogin').click()};
 $('bOut').onclick=async()=>{await api('logout',{}).catch(()=>{});show(false)};
 $('bCopy').onclick=async()=>{try{await navigator.clipboard.writeText($('sub').value);toast('已复制')}catch(e){$('sub').select();toast('请手动复制')}};
-$('bRot').onclick=async()=>{if(!confirm('换新链接后，旧链接立即失效，Clash 里要重新导入。继续？'))return;try{await api('rotate',{});toast('已换新链接');refresh()}catch(e){toast(e.message)}};
+$('bRot').onclick=async()=>{if(!confirm('换新链接后，旧链接立即失效，Clash 里要重新导入。继续？'))return;try{await api('rotate',{});toast('已换新链接');$('shareBox').classList.add('hide');$('qrs').replaceChildren();$('bShare').textContent='显示';refresh()}catch(e){toast(e.message)}};
 $('bAdd').onclick=async()=>{
   try{await api('add',{name:$('fName').value,server:$('fServer').value,port:$('fPort').value,username:$('fUser').value,password:$('fPass').value,udp:$('fUdp').checked});
     for(const k of ['fName','fServer','fPort','fUser','fPass'])$(k).value='';toast('已添加');refresh()}catch(e){toast(e.message)}};
@@ -766,14 +821,19 @@ class H(BaseHTTPRequestHandler):
             page = PAGE.replace("__NONCE__", nonce).replace("__BASE__", P)
             return self.send(200, page, "text/html; charset=utf-8", {
                 "Content-Security-Policy": f"default-src 'none'; script-src 'nonce-{nonce}'; "
-                f"style-src 'unsafe-inline'; connect-src 'self'; form-action 'none'; "
+                f"style-src 'unsafe-inline'; img-src data:; connect-src 'self'; form-action 'none'; "
                 "frame-ancestors 'none'; base-uri 'none'",
                 "X-Frame-Options": "DENY"})
         if path == P + "/api/list":
             if not self.authed():
                 return self.send(401, {"error": "请先登录"})
             items = [{k: v for k, v in i.items() if k != "password"} for i in load(S5DB, [])]
-            return self.send(200, {"items": items, "sub_url": self.sub_url(b)})
+            return self.send(200, {"items": items, "sub_url": self.sub_url(b), "domain": bool(b.get("domain"))})
+        if path == P + "/api/share":
+            if not self.authed():
+                return self.send(401, {"error": "请先登录"})
+            out = [("订阅（手机 Clash 扫码）", self.sub_url(b))] + share_links(b)
+            return self.send(200, {"items": [{"name": n, "link": l, "qr": qr_data_uri(l)} for n, l in out]})
         return self.nf()
 
     def do_POST(self):
@@ -1036,9 +1096,11 @@ if [ "$WEB_OK" = y ]; then
   if [ -n "$DOMAIN" ]; then
     echo "   https://${DOMAIN}${PANEL}/s/${TOKEN}"
     echo "   Clash Verge → 订阅 → 新建 → Remote → 粘贴 → 保存（正规证书，不用开「允许危险证书」）"
+    SUB_SHOW="https://${DOMAIN}${PANEL}/s/${TOKEN}"
   else
     echo "   https://${IP}:${WEB_PORT}/${TOKEN}"
     echo "   Clash Verge → 订阅 → 新建 → Remote → 粘贴 → 打开「允许危险证书」→ 保存"
+    SUB_SHOW="https://${IP}:${WEB_PORT}/${TOKEN}"
   fi
 else
   echo
@@ -1048,6 +1110,11 @@ fi
 echo
 if [ -n "$DOMAIN" ]; then
   echo " 伪装：Reality / Hysteria2 被探测时都显示你的网站 https://${DOMAIN}"
+fi
+if [ -n "${SUB_SHOW:-}" ] && command -v qrencode >/dev/null && [ -r /dev/tty ]; then
+  read -rp " 在这里显示订阅二维码（手机扫码导入）？[y/N]: " SHOWQR </dev/tty || true
+  case "${SHOWQR:-n}" in [yY]*) qrencode -t ANSIUTF8 -m 2 "$SUB_SHOW" ;; esac
+  echo " （网页后台「扫码 / 分享」里也能看到订阅和前置节点的二维码）"
 fi
 echo " 云服务器安全组 和 宝塔「安全」页 都要放行：TCP ${OPEN_TCP// /、TCP }、UDP ${HY2_PORT}"
 echo "=============================================================="
