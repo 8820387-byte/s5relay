@@ -29,9 +29,9 @@ if [ -z "$S5_SERVER" ]; then
 fi
 [ -n "$S5_SERVER" ] && [ -n "$S5_PORT" ] || { echo "S5 地址和端口不能为空"; exit 1; }
 
-REALITY_PORT=443
-HY2_PORT=8443       # Hysteria2 用 UDP 8443
-SUB_PORT=8443       # 订阅链接用 TCP 8443
+REALITY_PORT="${REALITY_PORT:-443}"   # 被占用时会自动换
+HY2_PORT="${HY2_PORT:-8443}"           # Hysteria2 用 UDP
+SUB_PORT="${SUB_PORT:-8443}"           # 订阅链接用 TCP
 SNI=www.microsoft.com
 CONF_DIR=/etc/sing-box
 SUB_DIR=/var/lib/clash-sub
@@ -49,9 +49,25 @@ fi
 command -v sing-box >/dev/null || { echo "sing-box 安装失败"; exit 1; }
 systemctl stop sing-box clash-sub 2>/dev/null || true
 
-if ss -ltn | awk '{print $4}' | grep -qE "[:.]${REALITY_PORT}\$"; then
-  echo "TCP ${REALITY_PORT} 被别的程序占用了（常见是 nginx），请先停掉它再运行"; exit 1
-fi
+tcp_busy() { ss -ltnH | awk '{print $4}' | grep -qE "[:.]$1\$"; }
+udp_busy() { ss -lunH | awk '{print $4}' | grep -qE "[:.]$1\$"; }
+pick_port() {   # pick_port tcp|udp 首选端口 备选...
+  local proto=$1; shift
+  for p in "$@"; do
+    if [ "$proto" = tcp ]; then tcp_busy "$p" || { echo "$p"; return; }
+    else udp_busy "$p" || { echo "$p"; return; }; fi
+  done
+  echo "端口 $* 全被占用" >&2; exit 1
+}
+OLD=$REALITY_PORT
+REALITY_PORT=$(pick_port tcp "$REALITY_PORT" 2443 2053 2083 2087 2096 9443)
+[ "$OLD" = "$REALITY_PORT" ] || echo "    TCP $OLD 被占用（$(ss -ltnpH "sport = :$OLD" | grep -o '"[^"]*"' | head -1 | tr -d '"')），自动改用 $REALITY_PORT"
+OLD=$SUB_PORT
+SUB_PORT=$(pick_port tcp "$SUB_PORT" 18443 28443 38443)
+[ "$OLD" = "$SUB_PORT" ] || echo "    TCP $OLD 被占用，订阅改用 $SUB_PORT"
+OLD=$HY2_PORT
+HY2_PORT=$(pick_port udp "$HY2_PORT" 18443 28443 38443)
+[ "$OLD" = "$HY2_PORT" ] || echo "    UDP $OLD 被占用，Hysteria2 改用 $HY2_PORT"
 
 echo ">>> [3/5] 生成密钥和服务端配置"
 UUID=$(sing-box generate uuid)
@@ -267,6 +283,6 @@ echo
 echo "  http://${IP}:${SUB_PORT}/${TOKEN}.yaml"
 echo
 echo "================================================"
-echo "别忘了：云服务器控制台的安全组放行 TCP 443、TCP 8443、UDP 8443"
+echo "别忘了：云服务器控制台的安全组放行 TCP ${REALITY_PORT}、TCP ${SUB_PORT}、UDP ${HY2_PORT}"
 echo "导入成功后，可以关掉订阅链接更安全：systemctl disable --now clash-sub"
 echo "想换 S5：重新运行同一条安装命令即可"
