@@ -13,6 +13,7 @@
 #        fail2ban 防 SSH 暴力破解；开启 BBR
 #
 #  安装：bash <(curl -fsSL https://raw.githubusercontent.com/8820387-byte/s5relay/main/install.sh)
+#  家里电脑节点：... install.sh) home         （关闭：home-off）
 #  重置后台密码：... install.sh) reset-pass
 #  关闭网页后台：... install.sh) web-off        （重新运行安装即可再打开）
 #  卸载：         ... install.sh) uninstall
@@ -50,8 +51,157 @@ remove_web() {   # 包括旧版本留下的订阅服务
   unhook_nginx
 }
 
+# ---------------------------------------------------------------- 家里电脑节点（frp）
+FRPS=/usr/local/bin/s5relay-frps
+
+remove_home() {
+  systemctl disable --now s5relay-frps >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/s5relay-frps.service "$FRPS" "$DATA/frps.toml" "$DATA/home.json" "$DATA/frpc_windows_amd64.zip"
+  systemctl daemon-reload 2>/dev/null || true
+  if [ -f "$APP" ] && [ -f "$DATA/base.json" ]; then
+    S5R_DIR=$DATA python3 "$APP" del-local || true
+    systemctl restart s5relay-web >/dev/null 2>&1 || true
+  fi
+}
+
+setup_home() {
+  [ -f "$APP" ] && [ -f "$DATA/base.json" ] || die "请先运行一次安装命令，再开启家里电脑节点"
+  local arch tag ver tmp p port
+  case "$(uname -m)" in
+    x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;;
+    *) die "不支持的服务器架构 $(uname -m)" ;;
+  esac
+  echo ">>> [1/4] 下载 frp"
+  tag=$(curl -fsSL --max-time 20 https://api.github.com/repos/fatedier/frp/releases/latest 2>/dev/null \
+        | python3 -c "import json,sys;print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || true)
+  if [ -z "$tag" ]; then   # API 被限流时，从发布页跳转地址取版本号
+    tag=$(curl -fsSI --max-time 20 https://github.com/fatedier/frp/releases/latest 2>/dev/null \
+          | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}' | awk -F/ '{print $NF}')
+  fi
+  case "$tag" in v[0-9]*) ;; *) die "获取 frp 版本失败（服务器连不上 GitHub）" ;; esac
+  ver=${tag#v}
+  tmp=$(mktemp -d)
+  curl -fsSL --max-time 120 -o "$tmp/frp.tgz" \
+    "https://github.com/fatedier/frp/releases/download/${tag}/frp_${ver}_linux_${arch}.tar.gz" || die "下载 frps 失败"
+  tar -xzf "$tmp/frp.tgz" -C "$tmp"
+  systemctl stop s5relay-frps >/dev/null 2>&1 || true
+  install -m 755 "$tmp"/frp_*/frps "$FRPS"
+  if curl -fsSL --max-time 120 -o "$DATA/frpc_windows_amd64.zip" \
+       "https://github.com/fatedier/frp/releases/download/${tag}/frp_${ver}_windows_amd64.zip"; then
+    chmod 600 "$DATA/frpc_windows_amd64.zip"
+  else
+    rm -f "$DATA/frpc_windows_amd64.zip"
+    echo "    Windows 版预下载失败，家里电脑会改从 GitHub 下载"
+  fi
+  rm -rf "$tmp"
+
+  echo ">>> [2/4] 生成配置"
+  port=""
+  for p in ${HOME_PORT:-7000} 7443 17000 27000; do
+    ss -ltnH | awk '{print $4}' | grep -qE "[:.]$p\$" || { port=$p; break; }
+  done
+  [ -n "$port" ] || die "端口 7000 / 7443 / 17000 / 27000 都被占用了"
+  eval "$(python3 - "$DATA/home.json" "$port" <<'PYEOF'
+import json, os, secrets, sys
+p, port = sys.argv[1], int(sys.argv[2])
+try:
+    h = json.load(open(p))
+except Exception:
+    h = {}
+h.setdefault("token", secrets.token_hex(24))
+h.setdefault("s5_user", "home")
+h.setdefault("s5_pass", secrets.token_hex(12))
+h.setdefault("dl_token", secrets.token_hex(16))
+h.setdefault("remote_port", 10800)
+h["bind_port"] = port
+with open(p + ".tmp", "w") as f:
+    json.dump(h, f, indent=2)
+os.chmod(p + ".tmp", 0o600)
+os.replace(p + ".tmp", p)
+print(f"H_TOKEN={h['token']} H_USER={h['s5_user']} H_PASS={h['s5_pass']} H_RPORT={h['remote_port']}")
+PYEOF
+)"
+  cat > "$DATA/frps.toml" <<EOF
+bindAddr = "0.0.0.0"
+bindPort = ${port}
+proxyBindAddr = "127.0.0.1"
+auth.method = "token"
+auth.token = "${H_TOKEN}"
+transport.tls.force = true
+transport.maxPoolCount = 10
+allowPorts = [ { single = ${H_RPORT} } ]
+log.to = "console"
+log.level = "warn"
+EOF
+  chmod 600 "$DATA/frps.toml"
+  "$FRPS" verify -c "$DATA/frps.toml" >/dev/null || die "frps 配置校验失败"
+
+  cat > /etc/systemd/system/s5relay-frps.service <<EOF
+[Unit]
+Description=s5relay home PC tunnel (frps)
+After=network.target
+
+[Service]
+ExecStart=${FRPS} -c ${DATA}/frps.toml
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now s5relay-frps >/dev/null 2>&1
+  sleep 1
+  systemctl is-active --quiet s5relay-frps || { journalctl -u s5relay-frps -n 20 --no-pager; die "frps 启动失败"; }
+
+  echo ">>> [3/4] 放行端口 TCP ${port}"
+  if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then ufw allow "${port}/tcp" >/dev/null; fi
+  if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null; firewall-cmd --reload >/dev/null
+  fi
+
+  echo ">>> [4/4] 加入 S5 列表"
+  S5R_DIR=$DATA python3 "$APP" add "家里电脑" 127.0.0.1 "$H_RPORT" "$H_USER" "$H_PASS" noudp
+  systemctl restart s5relay-web >/dev/null 2>&1 || true
+
+  local DOMAIN_ PANEL_ DL_
+  DOMAIN_=$(python3 -c "import json;print(json.load(open('$DATA/base.json')).get('domain') or '')")
+  PANEL_=$(python3 -c "import json;print(json.load(open('$DATA/base.json'))['panel_path'])")
+  DL_=$(python3 -c "import json;print(json.load(open('$DATA/home.json'))['dl_token'])")
+  echo
+  echo "======================= 家里电脑节点已开启 ======================="
+  echo
+  echo " 1) 云服务器安全组 和 宝塔「安全」页 放行：TCP ${port}"
+  echo
+  echo " 2) 在【家里的 Windows 电脑】上打开 PowerShell，粘贴运行："
+  if [ -n "$DOMAIN_" ]; then
+    echo
+    echo "    irm https://${DOMAIN_}${PANEL_}/h/${DL_}/setup.ps1 | iex"
+    echo
+    echo "    （或者：网页后台 →「家里电脑节点」→ 下载脚本 → 右键「使用 PowerShell 运行」）"
+  else
+    echo "    网页后台 →「家里电脑节点」→ 下载脚本 → 右键「使用 PowerShell 运行」"
+  fi
+  echo
+  echo " 3) 网页后台对「家里电脑」点「测试」，显示出口 IP 即成功"
+  echo "    Clash 里更新订阅，选「家里电脑-加速」就是用家里的网络上网"
+  echo
+  echo " 关闭：bash <(curl -fsSL ${RAW}) home-off"
+  echo "================================================================="
+}
+
 case "${1:-}" in
+  home)
+    setup_home; exit 0 ;;
+  home-off)
+    remove_home
+    echo "家里电脑节点已关闭。家里电脑上删除「启动」文件夹里的 s5relay-home.vbs 并结束 frpc 进程即可"; exit 0 ;;
   uninstall)
+    remove_home
     remove_web
     systemctl disable --now sing-box >/dev/null 2>&1 || true
     rm -rf "$CONF_DIR" "$DATA" /usr/local/lib/s5relay /root/clash.yaml /etc/cron.daily/s5relay-cert
@@ -280,7 +430,7 @@ cat > "$APP" <<'PYEOF'
 #   render                     重新生成 clash.yaml
 #   add 名称 地址 端口 [账号] [密码]
 #   passwd                     重置后台密码（打印新密码）
-import base64, hashlib, hmac, html, json, os, re, secrets, socket, ssl, struct, subprocess, sys, threading, time
+import base64, hashlib, hmac, html, ipaddress, json, os, re, secrets, shutil, socket, ssl, struct, subprocess, sys, threading, time, uuid
 from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
@@ -289,7 +439,12 @@ DIR = os.environ.get("S5R_DIR", "/etc/s5relay")
 BASE = os.path.join(DIR, "base.json")
 S5DB = os.path.join(DIR, "s5.json")
 AUTH = os.path.join(DIR, "auth.json")
+HOME = os.path.join(DIR, "home.json")
+HOME_ZIP = os.path.join(DIR, "frpc_windows_amd64.zip")
+LOCAL_HOSTS = ("127.0.0.1", "localhost")
 OUT = os.path.join(DIR, "clash.yaml")
+SB_CONF = os.environ.get("S5R_SB_CONF", "/etc/sing-box/config.json")
+SB_BAK = os.path.join(DIR, "sb-config.bak")
 LOCK = threading.RLock()
 FAILS = {}  # ip -> [次数, 首次时间]
 
@@ -399,6 +554,8 @@ def render():
         names = []
         for kind in ("直连", "加速"):
             for it in items:
+                if kind == "直连" and it["server"] in LOCAL_HOSTS:
+                    continue
                 name = f"{it['name']}-{kind}"
                 names.append(name)
                 L += [f"  - name: {q(name)}", "    type: socks5",
@@ -410,7 +567,7 @@ def render():
                     L.append('    dialer-proxy: "前置节点"')
                 L.append("")
         L += ["proxy-groups:", '  - name: "🚀 节点选择"', "    type: select", "    proxies:"]
-        L += [f"      - {q(n)}" for n in names + ["自建-Reality", "自建-Hy2"]]
+        L += [f"      - {q(n)}" for n in names]   # 前置节点只用来中转，不能当出口（出口会是服务器 IP）
         L += ["      - DIRECT", ""]
         footer = FOOTER
         if b.get("domain"):   # 自己的网站（后台/订阅）一律直连，更新订阅不绕代理
@@ -425,16 +582,116 @@ def render():
 
 
 # ---------------------------------------------------------------- 分享链接 / 二维码
-def share_links(b):
+def universal_sub(b, items):
+    """通用订阅：base64 的分享链接列表，小火箭 / v2rayN / NekoBox 等直接导入全部节点。
+    只提供「出口是 S5」的节点，不提供出口是服务器的节点。"""
+    links = [l for _, l in share_s5(b, items)]
+    return base64.b64encode("\n".join(links).encode()).decode()
+
+def share_s5(b, items):
+    """每个 S5 一组「出口 S5」专用链接：导入小火箭等客户端后，出口直接就是这个 S5。
+    不依赖客户端的链式代理：服务器按用户把流量转给对应的 S5。"""
+    out = []
     ip = b["ip"]
-    v = (f"vless://{b['uuid']}@{ip}:{b['reality_port']}?encryption=none&flow=xtls-rprx-vision"
-         f"&security=reality&sni={quote(b['sni'])}&fp=chrome&pbk={b['pub_key']}&sid={b['short_id']}"
-         f"&type=tcp#Reality")
-    if b.get("domain"):
-        h = f"hysteria2://{b['hy2_pass']}@{ip}:{b['hy2_port']}?sni={quote(b['domain'])}#Hy2"
-    else:
-        h = f"hysteria2://{b['hy2_pass']}@{ip}:{b['hy2_port']}?sni=bing.com&insecure=1#Hy2"
-    return [("自建-Reality（推荐）", v), ("自建-Hy2", h)]
+    for it in items:
+        if not it.get("uid"):
+            continue
+        n = it["name"]
+        if b.get("domain"):
+            h = f"hysteria2://{it['hpass']}@{ip}:{b['hy2_port']}?sni={quote(b['domain'])}#{quote(n + '-Hy2')}"
+        else:
+            h = f"hysteria2://{it['hpass']}@{ip}:{b['hy2_port']}?sni=bing.com&insecure=1#{quote(n + '-Hy2')}"
+        v = (f"vless://{it['uid']}@{ip}:{b['reality_port']}?encryption=none"
+             f"&security=reality&sni={quote(b['sni'])}&fp=chrome&pbk={b['pub_key']}&sid={b['short_id']}"
+             f"&type=tcp#{quote(n + '-Reality')}")
+        out += [(f"出口 {n} · Hy2（推荐）", h), (f"出口 {n} · Reality（无流控）", v)]
+    return out
+
+
+def sync_singbox():
+    """把每个 S5 写成 sing-box 的专用用户 + 出站（按用户路由）。成功返回 ok/unchanged，失败返回 error: ..."""
+    with LOCK:
+        if not os.path.exists(SB_CONF):
+            return "unchanged"
+        items = load(S5DB, [])
+        ch = False
+        for i in items:
+            if not i.get("uid"):
+                i["uid"], ch = str(uuid.uuid4()), True
+            if not i.get("hpass"):
+                i["hpass"], ch = secrets.token_hex(16), True
+        if ch:
+            save(S5DB, items)
+        with open(SB_CONF, encoding="utf-8") as f:
+            cfg = json.load(f)
+        before = json.dumps(cfg, sort_keys=True)
+        cfg["outbounds"] = [o for o in cfg.get("outbounds", []) if not str(o.get("tag", "")).startswith("s5-")]
+        route = cfg.setdefault("route", {})
+        inbs = [x for x in cfg["inbounds"] if x.get("type") in ("vless", "hysteria2")]
+        tags = [x["tag"] for x in inbs]
+        route["rules"] = [r for r in route.get("rules", [])
+                          if not any(str(u).startswith("s5-") for u in r.get("auth_user", []))
+                          and r.get("inbound") != tags]
+        for ib in inbs:
+            ib["users"] = [u for u in ib.get("users", []) if not str(u.get("name", "")).startswith("s5-")]
+        for it in items:
+            tag = "s5-" + it["id"]
+            ob = {"type": "socks", "tag": tag, "server": it["server"],
+                  "server_port": int(it["port"]), "version": "5"}
+            if it.get("username"):
+                ob["username"], ob["password"] = it["username"], it.get("password", "")
+            if not it.get("udp", True):
+                ob["network"] = "tcp"
+            cfg["outbounds"].append(ob)
+            route["rules"].append({"auth_user": [tag], "outbound": tag})
+            for ib in inbs:
+                if ib["type"] == "vless":
+                    ib["users"].append({"name": tag, "uuid": it["uid"]})   # 不带流控，兼容小火箭
+                else:
+                    ib["users"].append({"name": tag, "password": it["hpass"]})
+        # 前置节点（Clash 链式用的那个用户）只允许去配置好的 S5 地址，其余一律拒绝：
+        # 任何人都没法把服务器本身当出口（出口永远不是服务器 IP），也碰不到服务器本机的服务
+        ips, hosts, ports = [], ["www.gstatic.com"], set()   # gstatic：Clash 前置节点健康检查
+        for it in items:
+            ports.add(int(it["port"]))
+            try:
+                a = ipaddress.ip_address(it["server"])
+                ips.append(f"{a}/{32 if a.version == 4 else 128}")
+            except ValueError:
+                hosts.append(it["server"])
+        if ips and ports:
+            route["rules"].append({"inbound": tags, "ip_cidr": ips, "port": sorted(ports), "outbound": "direct"})
+        route["rules"].append({"inbound": tags, "domain": hosts, "outbound": "direct"})
+        route["rules"].append({"inbound": tags, "action": "reject"})
+        if json.dumps(cfg, sort_keys=True) == before:
+            return "unchanged"
+        tmp = SB_CONF + ".tmp"
+        st = os.stat(SB_CONF)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, st.st_mode & 0o777)
+        try:
+            os.chown(tmp, st.st_uid, st.st_gid)
+        except (OSError, AttributeError):
+            pass
+        sb = shutil.which("sing-box") or "/usr/bin/sing-box"
+        r = subprocess.run([sb, "check", "-c", tmp], capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            os.remove(tmp)
+            return "error: sing-box 配置检查未通过 " + (r.stderr or r.stdout).strip()[:150]
+        shutil.copy2(SB_CONF, SB_BAK)
+        os.replace(tmp, SB_CONF)
+        subprocess.run(["systemctl", "restart", "sing-box"], timeout=30)
+        time.sleep(1.5)
+        if subprocess.run(["systemctl", "is-active", "--quiet", "sing-box"]).returncode != 0:
+            shutil.copy2(SB_BAK, SB_CONF)
+            subprocess.run(["systemctl", "restart", "sing-box"], timeout=30)
+            return "error: sing-box 启动失败，已还原原配置"
+        return "ok"
+
+
+def warn_of(r):
+    return r if str(r).startswith("error") else None
 
 
 def qr_data_uri(text):
@@ -444,6 +701,98 @@ def qr_data_uri(text):
         return "data:image/svg+xml;base64," + base64.b64encode(svg).decode()
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------- 家里电脑节点（frp）
+def home_urls(b, h):
+    if not b.get("domain"):
+        return None, None
+    base = f"https://{b['domain']}{b['panel_path']}/h/{h['dl_token']}"
+    return base + "/setup.ps1", (base + "/frpc.zip" if os.path.exists(HOME_ZIP) else "")
+
+
+def home_ps1(b, h):
+    _, zip_url = home_urls(b, h)
+    toml = f"""serverAddr = "{b['ip']}"
+serverPort = {int(h['bind_port'])}
+loginFailExit = false
+auth.method = "token"
+auth.token = "{h['token']}"
+transport.tls.enable = true
+transport.poolCount = 8
+log.to = "console"
+log.level = "warn"
+
+[[proxies]]
+name = "s5relay-home"
+type = "tcp"
+remotePort = {int(h['remote_port'])}
+[proxies.plugin]
+type = "socks5"
+username = "{h['s5_user']}"
+password = "{h['s5_pass']}"
+"""
+    return ('''# s5relay 家里电脑节点安装脚本（Windows）
+# 用法：右键 → 使用 PowerShell 运行；或在 PowerShell 里：irm <链接> | iex
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$Dir  = Join-Path $env:LOCALAPPDATA 's5relay-home'
+$Exe  = Join-Path $Dir 'frpc.exe'
+$Conf = Join-Path $Dir 'frpc.toml'
+New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+Get-Process frpc -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Exe } | Stop-Process -Force
+
+if (-not (Test-Path $Exe)) {
+  Write-Host '[1/3] 下载 frpc ...'
+  $zip = Join-Path $env:TEMP 's5relay-frp.zip'
+  $urls = @()
+  $mine = '__ZIP_URL__'
+  if ($mine) { $urls += $mine }
+  try {
+    $rel = Invoke-RestMethod -Headers @{ 'User-Agent' = 's5relay' } 'https://api.github.com/repos/fatedier/frp/releases/latest'
+    $gh = ($rel.assets | Where-Object { $_.name -like '*_windows_amd64.zip' } | Select-Object -First 1).browser_download_url
+    if ($gh) { $urls += $gh; $urls += ('https://ghfast.top/' + $gh) }
+  } catch {}
+  $ok = $false
+  foreach ($u in $urls) {
+    try { Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $zip; $ok = $true; break } catch {}
+  }
+  if (-not $ok) { throw '下载 frpc 失败，请检查网络后重试' }
+  $tmp = Join-Path $env:TEMP 's5relay-frp'
+  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+  Expand-Archive -Force -Path $zip -DestinationPath $tmp
+  $f = Get-ChildItem -Recurse -Path $tmp -Filter frpc.exe | Select-Object -First 1
+  if (-not $f) { throw '压缩包里没找到 frpc.exe（可能被杀毒软件删除了）' }
+  Copy-Item $f.FullName $Exe -Force
+  Remove-Item -Recurse -Force $tmp, $zip -ErrorAction SilentlyContinue
+} else {
+  Write-Host '[1/3] frpc 已存在，跳过下载'
+}
+
+Write-Host '[2/3] 写入配置，设置开机自动运行'
+$toml = @'
+__TOML__'@
+[IO.File]::WriteAllText($Conf, $toml, (New-Object Text.UTF8Encoding $false))
+$Vbs = Join-Path ([Environment]::GetFolderPath('Startup')) 's5relay-home.vbs'
+$line = 'CreateObject("WScript.Shell").Run """' + $Exe + '"" -c ""' + $Conf + '""", 0, False'
+[IO.File]::WriteAllText($Vbs, $line, [Text.Encoding]::Unicode)   # 支持中文用户名路径
+
+Write-Host '[3/3] 启动'
+Start-Process -WindowStyle Hidden -FilePath $Exe -ArgumentList @('-c', $Conf)
+Start-Sleep -Seconds 4
+if (Get-Process frpc -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Exe }) {
+  Write-Host ''
+  Write-Host '完成！这台电脑已经连上服务器。' -ForegroundColor Green
+  Write-Host '回到网页后台，对「家里电脑」点「测试」，看到出口 IP 就是这台电脑的网络。'
+  Write-Host '以后开机登录后会自动在后台运行。停用：删除启动文件夹里的 s5relay-home.vbs 并结束 frpc 进程。'
+} else {
+  Write-Host 'frpc 没有运行起来：可能被 Windows 安全中心拦截了。' -ForegroundColor Yellow
+  Write-Host '打开「Windows 安全中心 → 病毒和威胁防护 → 保护历史记录」，找到 frpc 选「允许」，再运行一次本脚本。'
+}
+'''
+            .replace("__ZIP_URL__", zip_url or "")
+            .replace("__TOML__", toml))
 
 
 # ---------------------------------------------------------------- S5 校验 / 解析
@@ -471,7 +820,8 @@ def clean_item(d, items):
     while name in used:
         name, n = f"{base}-{n}", n + 1
     return {"id": secrets.token_hex(4), "name": name, "server": server, "port": port,
-            "username": user, "password": pw if user else "", "udp": bool(d.get("udp", True))}
+            "username": user, "password": pw if user else "", "udp": bool(d.get("udp", True)),
+            "uid": str(uuid.uuid4()), "hpass": secrets.token_hex(16)}
 
 
 def parse_line(line):
@@ -538,10 +888,20 @@ def s5_test(it):
         s.sendall(b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
         data = b""
         while len(data) < 4096:
-            c = s.recv(4096)
+            try:
+                c = s.recv(4096)
+            except socket.timeout:
+                if data:      # 经 frp 等隧道转发时对方可能不主动关连接，已收到数据就算完成
+                    break
+                raise
             if not c:
                 break
             data += c
+            head, sep, rest = data.partition(b"\r\n\r\n")
+            if sep:           # 按 Content-Length 判断响应收完，不傻等对方关闭连接
+                m = re.search(rb"(?i)content-length:\s*(\d+)", head)
+                if m and len(rest) >= int(m.group(1)):
+                    break
         ms = int((time.time() - t0) * 1000)
         body = data.split(b"\r\n\r\n", 1)[-1].decode(errors="ignore").strip()
         ip = body if re.match(r"^[0-9a-fA-F.:]{3,45}$", body) else ""
@@ -629,6 +989,7 @@ th{color:var(--mut);font-weight:500;font-size:12px}td.act{white-space:nowrap;tex
 #login{max-width:360px;margin:12vh auto}
 #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#111;color:#fff;padding:8px 16px;border-radius:6px;display:none;z-index:9}
 .hide{display:none}
+code{background:var(--bg);padding:1px 5px;border-radius:4px;font-size:12px}
 .qrs{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-bottom:8px}
 .qr{border:1px solid var(--line);border-radius:8px;padding:12px;text-align:center}
 .qr img{width:240px;height:240px;max-width:100%;background:#fff;border-radius:6px;image-rendering:pixelated}
@@ -652,8 +1013,11 @@ th{color:var(--mut);font-weight:500;font-size:12px}td.act{white-space:nowrap;tex
     <div class="row" style="margin-bottom:8px"><h2 style="margin:0">扫码 / 分享</h2><button class="g" id="bShare">显示</button></div>
     <div id="shareBox" class="hide">
       <div class="qrs" id="qrs"></div>
-      <p class="mut">订阅二维码：手机 Clash（FlClash / Stash / Clash Meta）扫码导入，包含全部 S5 和加速链路。<br>
-      Reality / Hy2：单个前置节点，可导入 v2rayN、Shadowrocket（小火箭）、NekoBox、sing-box 等。<br>
+      <div class="row" style="margin-bottom:8px"><span></span><button class="g" id="bMore">展开单个节点链接</button></div>
+      <div class="qrs hide" id="qrs2"></div>
+      <p class="mut">通用订阅：小火箭 / v2rayN / NekoBox 扫一次，导入全部「出口 S5」节点，出口是对应的 S5。<br>
+      Clash 订阅：Clash 系客户端（FlClash / Stash / Clash Meta）扫码，包含全部 S5 和链式加速。<br>
+      「出口 xxx」节点：服务器按用户把流量转给对应的 S5，出口一定是那个 S5，不会是服务器 IP。<br>
       ⚠ 拿到这些的人就能用你的服务器，只给自己的设备用。泄露了重新运行安装命令即可全部换新。</p>
     </div>
   </div>
@@ -677,6 +1041,19 @@ th{color:var(--mut);font-weight:500;font-size:12px}td.act{white-space:nowrap;tex
     <p class="mut">每个 S5 在 Clash 里会出现两个：「名称-直连」和「名称-加速」（经你的服务器中转）。</p>
   </div>
 
+  <div class="card" id="homeCard">
+    <h2>家里电脑节点</h2>
+    <div id="homeOff" class="mut">还没开启。在服务器上运行安装命令后面加 <b>home</b>（例如 <code>bash &lt;(curl -fsSL …/install.sh) home</code>），刷新本页即可。</div>
+    <div id="homeOn" class="hide">
+      <p class="mut">在<b>家里的 Windows 电脑</b>上做下面任意一种（不需要管理员权限）：</p>
+      <div id="homeCmdRow"><p style="margin:4px 0">① 打开 PowerShell，粘贴运行：</p>
+        <div class="row"><input id="homeCmd" readonly><button id="bHomeCopy">复制</button></div></div>
+      <p style="margin:10px 0 4px">② 下载脚本 → 右键 →「使用 PowerShell 运行」：</p>
+      <button class="g" id="bHomeDl">下载 家里电脑节点.ps1</button>
+      <p class="mut">运行后在上面 S5 列表里对「家里电脑」点「测试」，显示出口 IP 就成功了。Clash 里选「家里电脑-加速」即可从外面经服务器用家里的网络。这个命令里含密钥，不要发给别人。</p>
+    </div>
+  </div>
+
   <div class="card">
     <h2>修改后台密码</h2>
     <div class="grid"><input id="pOld" type="password" placeholder="原密码"><input id="pNew" type="password" placeholder="新密码（至少 8 位）" autocomplete="new-password"></div>
@@ -695,6 +1072,7 @@ async function api(p, body){
   let j={}; try{j=await r.json()}catch(e){}
   if(r.status===401){show(false);throw new Error(j.error||'请先登录')}
   if(!r.ok) throw new Error(j.error||('出错了 '+r.status));
+  if(j.warn) toast(j.warn);
   return j;
 }
 function show(logged){$('login').classList.toggle('hide',logged);$('app').classList.toggle('hide',!logged);if(!logged)$('pw').focus()}
@@ -713,6 +1091,8 @@ function draw(){
   }
 }
 async function refresh(){const j=await api('list');items=j.items;$('sub').value=j.sub_url;
+  $('homeOff').classList.toggle('hide',!!j.home);$('homeOn').classList.toggle('hide',!j.home);
+  if(j.home){$('homeCmdRow').classList.toggle('hide',!j.home.cmd);$('homeCmd').value=j.home.cmd||''}
   $('subHint').textContent='Clash Verge → 订阅 → 新建 → Remote → 粘贴'+(j.domain?'':'，打开「允许危险证书」')+'。在这里改了 S5 后，Clash 里点一下「更新」就生效。链接泄露了就点「换新链接」。';
   draw();show(true)}
 function qrCard(name,link,qr){
@@ -725,9 +1105,16 @@ function qrCard(name,link,qr){
 }
 $('bShare').onclick=async()=>{
   const box=$('shareBox');
-  if(!box.classList.contains('hide')){box.classList.add('hide');$('qrs').replaceChildren();$('bShare').textContent='显示';return}
+  if(!box.classList.contains('hide')){hideShare();return}
   try{const j=await api('share');$('qrs').replaceChildren(...j.items.map(x=>qrCard(x.name,x.link,x.qr)));
     box.classList.remove('hide');$('bShare').textContent='隐藏'}catch(e){toast(e.message)}};
+function hideShare(){$('shareBox').classList.add('hide');$('qrs').replaceChildren();$('qrs2').replaceChildren();
+  $('qrs2').classList.add('hide');$('bMore').textContent='展开单个节点链接';$('bShare').textContent='显示'}
+$('bMore').onclick=async()=>{
+  const q=$('qrs2');
+  if(!q.classList.contains('hide')){q.classList.add('hide');q.replaceChildren();$('bMore').textContent='展开单个节点链接';return}
+  try{const j=await api('share?more=1');q.replaceChildren(...j.items.map(x=>qrCard(x.name,x.link,x.qr)));
+    q.classList.remove('hide');$('bMore').textContent='收起单个节点链接'}catch(e){toast(e.message)}};
 async function test(it){
   const c=$('r'+it.id);if(c){c.textContent='测试中…';c.className='mut'}
   try{const j=await api('test',{id:it.id});
@@ -740,12 +1127,16 @@ $('bLogin').onclick=async()=>{try{await api('login',{password:$('pw').value});$(
 $('pw').onkeydown=e=>{if(e.key==='Enter')$('bLogin').click()};
 $('bOut').onclick=async()=>{await api('logout',{}).catch(()=>{});show(false)};
 $('bCopy').onclick=async()=>{try{await navigator.clipboard.writeText($('sub').value);toast('已复制')}catch(e){$('sub').select();toast('请手动复制')}};
-$('bRot').onclick=async()=>{if(!confirm('换新链接后，旧链接立即失效，Clash 里要重新导入。继续？'))return;try{await api('rotate',{});toast('已换新链接');$('shareBox').classList.add('hide');$('qrs').replaceChildren();$('bShare').textContent='显示';refresh()}catch(e){toast(e.message)}};
+$('bRot').onclick=async()=>{if(!confirm('换新链接后，旧链接立即失效，Clash 里要重新导入。继续？'))return;try{await api('rotate',{});toast('已换新链接');hideShare();refresh()}catch(e){toast(e.message)}};
 $('bAdd').onclick=async()=>{
   try{await api('add',{name:$('fName').value,server:$('fServer').value,port:$('fPort').value,username:$('fUser').value,password:$('fPass').value,udp:$('fUdp').checked});
     for(const k of ['fName','fServer','fPort','fUser','fPass'])$(k).value='';toast('已添加');refresh()}catch(e){toast(e.message)}};
 $('bBulk').onclick=async()=>{try{const j=await api('bulk',{text:$('bulk').value});$('bulk').value='';toast('导入 '+j.added+' 个'+(j.errors.length?'，失败 '+j.errors.length+' 行：'+j.errors.slice(0,3).join('；'):''));refresh()}catch(e){toast(e.message)}};
 $('bTestAll').onclick=async()=>{const b=$('bTestAll');b.disabled=true;await Promise.all(items.map(test));b.disabled=false};
+$('bHomeCopy').onclick=async()=>{try{await navigator.clipboard.writeText($('homeCmd').value);toast('已复制')}catch(e){$('homeCmd').select();toast('请手动复制')}};
+$('bHomeDl').onclick=async()=>{try{const r=await fetch(BASE+'/api/home-script',{headers:{'X-S5R':'1'},credentials:'same-origin'});
+  if(!r.ok)throw new Error('下载失败 '+r.status);const u=URL.createObjectURL(await r.blob());const a=document.createElement('a');
+  a.href=u;a.download='家里电脑节点.ps1';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),5000)}catch(e){toast(e.message)}};
 $('bPw').onclick=async()=>{try{await api('passwd',{old:$('pOld').value,new:$('pNew').value});$('pOld').value=$('pNew').value='';toast('密码已修改，请重新登录');show(false)}catch(e){toast(e.message)}};
 refresh().catch(()=>show(false));
 </script></body></html>"""
@@ -803,12 +1194,28 @@ class H(BaseHTTPRequestHandler):
             return f"https://{b['domain']}{b['panel_path']}/s/{b['sub_token']}"
         return f"https://{b['ip']}:{b['web_port']}/{b['sub_token']}"
 
+    def sub_url_u(self, b):   # 通用订阅（小火箭等）
+        host = b["domain"] if b.get("domain") else f"{b['ip']}:{b['web_port']}"
+        return f"https://{host}{b['panel_path']}/u/{b['sub_token']}"
+
     # ---- 路由
     def do_GET(self):
         b = load(BASE, {})
         path = self.path.split("?")[0]
         P = b.get("panel_path", "/\0")
+        h = load(HOME, None)
+        if h and path.startswith(P + "/h/"):     # 家里电脑脚本 / 安装包（带随机密钥）
+            rest = path[len(P) + 3:]
+            if hmac.compare_digest(rest, h["dl_token"] + "/setup.ps1"):
+                return self.send(200, home_ps1(b, h), "text/plain; charset=utf-8")
+            if hmac.compare_digest(rest, h["dl_token"] + "/frpc.zip") and os.path.exists(HOME_ZIP):
+                with open(HOME_ZIP, "rb") as f:
+                    return self.send(200, f.read(), "application/zip")
+            return self.nf()
         tok = b.get("sub_token")
+        if tok and hmac.compare_digest(path, P + "/u/" + tok):
+            return self.send(200, universal_sub(b, load(S5DB, [])), "text/plain; charset=utf-8",
+                             {"profile-update-interval": "24"})
         if tok and (hmac.compare_digest(path, "/" + tok) or hmac.compare_digest(path, P + "/s/" + tok)):
             text = render()
             return self.send(200, text, "text/yaml; charset=utf-8", {
@@ -828,11 +1235,29 @@ class H(BaseHTTPRequestHandler):
             if not self.authed():
                 return self.send(401, {"error": "请先登录"})
             items = [{k: v for k, v in i.items() if k != "password"} for i in load(S5DB, [])]
-            return self.send(200, {"items": items, "sub_url": self.sub_url(b), "domain": bool(b.get("domain"))})
+            h = load(HOME, None)
+            home = None
+            if h:
+                ps1_url, _ = home_urls(b, h)
+                home = {"cmd": f"irm {ps1_url} | iex" if ps1_url else ""}
+            return self.send(200, {"items": items, "sub_url": self.sub_url(b),
+                                   "domain": bool(b.get("domain")), "home": home})
+        if path == P + "/api/home-script":
+            if not self.authed():
+                return self.send(401, {"error": "请先登录"})
+            h = load(HOME, None)
+            if not h:
+                return self.nf()
+            return self.send(200, home_ps1(b, h).encode("utf-8-sig"), "application/octet-stream",
+                             {"Content-Disposition": "attachment; filename=s5relay-home.ps1"})
         if path == P + "/api/share":
             if not self.authed():
                 return self.send(401, {"error": "请先登录"})
-            out = [("订阅（手机 Clash 扫码）", self.sub_url(b))] + share_links(b)
+            if "more=1" in self.path:      # 单个节点链接（按需生成，避免一次太多二维码）
+                out = share_s5(b, load(S5DB, []))
+            else:                          # 默认只给两个二维码：扫一次导入全部
+                out = [("通用订阅 · 小火箭 / v2rayN / NekoBox 扫这个（全部节点）", self.sub_url_u(b)),
+                       ("Clash 订阅 · Clash 系客户端扫这个（链式加速）", self.sub_url(b))]
             return self.send(200, {"items": [{"name": n, "link": l, "qr": qr_data_uri(l)} for n, l in out]})
         return self.nf()
 
@@ -872,7 +1297,7 @@ class H(BaseHTTPRequestHandler):
                 if act == "add":
                     items.append(clean_item(d, items))
                     save(S5DB, items); render()
-                    return self.send(200, {"ok": True})
+                    return self.send(200, {"ok": True, "warn": warn_of(sync_singbox())})
                 if act == "bulk":
                     added, errors = 0, []
                     for n, line in enumerate(str(d.get("text", "")).splitlines()[:2000], 1):
@@ -883,11 +1308,11 @@ class H(BaseHTTPRequestHandler):
                         except ValueError as e:
                             errors.append(f"第{n}行{e}")
                     save(S5DB, items); render()
-                    return self.send(200, {"added": added, "errors": errors})
+                    return self.send(200, {"added": added, "errors": errors, "warn": warn_of(sync_singbox())})
                 if act == "delete":
                     items = [i for i in items if i["id"] != d.get("id")]
                     save(S5DB, items); render()
-                    return self.send(200, {"ok": True})
+                    return self.send(200, {"ok": True, "warn": warn_of(sync_singbox())})
                 if act == "rotate":
                     b["sub_token"] = secrets.token_hex(24)
                     save(BASE, b)
@@ -942,15 +1367,31 @@ if __name__ == "__main__":
         with LOCK:
             items = load(S5DB, [])
             new = clean_item({"name": a[0], "server": a[1], "port": a[2],
-                              "username": a[3], "password": a[4]}, items)
+                              "username": a[3], "password": a[4],
+                              "udp": a[5] != "noudp"}, items)
             same = [i for i in items if (i["server"], i["port"], i["username"]) ==
                     (new["server"], new["port"], new["username"])]
             if same:   # 重复安装时不重复添加，只更新密码
                 same[0]["password"] = new["password"]
+                same[0]["udp"] = new["udp"]
             else:
                 items.append(new)
             save(S5DB, items)
         render()
+        r = sync_singbox()
+        if r.startswith("error"):
+            print(r)
+    elif cmd == "del-local":
+        with LOCK:
+            save(S5DB, [i for i in load(S5DB, []) if i["server"] not in LOCAL_HOSTS])
+        render()
+        r = sync_singbox()
+        if r.startswith("error"):
+            print(r)
+    elif cmd == "sync-sb":
+        r = sync_singbox()
+        if r.startswith("error"):
+            print(r)
     elif cmd == "passwd":
         pw = secrets.token_urlsafe(12)
         set_password(pw)
@@ -994,6 +1435,7 @@ if [ ! -f "$DATA/auth.json" ]; then
   NEWPW=$(S5R_DIR=$DATA python3 "$APP" passwd)
 fi
 S5R_DIR=$DATA python3 "$APP" render
+S5R_DIR=$DATA python3 "$APP" sync-sb || true   # 每个 S5 的专用入口（给小火箭等不支持链式代理的客户端）
 ln -sf "$DATA/clash.yaml" /root/clash.yaml
 
 PANEL=$(python3 -c "import json;print(json.load(open('$DATA/base.json'))['panel_path'])")
@@ -1020,7 +1462,7 @@ Restart=always
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=${DATA}
+ReadWritePaths=${DATA} ${CONF_DIR}
 PrivateTmp=yes
 
 [Install]

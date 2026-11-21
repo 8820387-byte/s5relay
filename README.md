@@ -22,6 +22,8 @@
 - 网页后台：添加 / 批量导入 / 测试 / 删除 S5，改完订阅自动更新
 - 每个 S5 生成「直连」和「加速（经 VPS 中转）」两个节点
 - 后台测试可看到 S5 的延迟、出口 IP、账号密码是否正确
+- 「出口 S5」专用链接：每个 S5 一组 Hy2 / Reality 链接，导入后出口直接是那个 S5，适合小火箭等不支持链式代理的客户端（服务器按用户把流量转给对应 S5）
+- 出口永远不是服务器 IP：前置节点只允许访问你配置的 S5 地址，其余一律拒绝；订阅里不提供出口是服务器的节点
 - 扫码 / 分享：订阅二维码（手机 Clash 扫码导入全部节点），Reality / Hy2 分享链接和二维码（v2rayN、小火箭、NekoBox 等可导入）
 
 ## 安全设计
@@ -44,6 +46,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/8820387-byte/s5relay/main/in
 提示「宝塔里 WordPress 网站的域名」时填域名即为伪装模式。装完会显示后台地址、后台密码、订阅链接。
 
 云服务器安全组和宝塔「安全」页放行脚本最后显示的端口（伪装模式一般是 TCP 2443、UDP 8443）。
+
+## 家里电脑节点
+
+让外面的设备经服务器用家里电脑的网络上网（出口是家里的 IP）。家里没有公网 IP 也能用：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/8820387-byte/s5relay/main/install.sh) home
+```
+
+然后在家里的 Windows 电脑上运行后台「家里电脑节点」里给出的 PowerShell 命令。Clash 里选「家里电脑-加速」。安全组放行 TCP 7000。关闭：`... install.sh) home-off`
 
 ## 常用命令
 
